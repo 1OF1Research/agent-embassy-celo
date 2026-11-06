@@ -2,7 +2,7 @@
 
 Pay-per-call verification, settled on Celo through the x402 protocol — built for the **Agents on Open Rails** hackathon (Open Corridors → **USA₮ with x402** subtrack). Registration and submission close **Nov 9, 2026, 09:00 GMT**.
 
-Agent Embassy is a live agent-payments service: agents pay per call and every call returns a signed outcome receipt. This repository is its Celo deployment, written during the hackathon window. The production service (25 tools on Base and other chains) lives elsewhere; this repo is the Celo surface, derived from the same stack — the same `@x402` v2 packages, the same receipt format (`embassy-receipt/2`), the same signing scheme.
+Agent Embassy is a live agent-payments service: agents pay per call and every call returns a signed outcome receipt. This repository is its Celo deployment, written during the hackathon window. The production service (33 tools on Base and other chains) lives elsewhere; this repo is the Celo surface, derived from the same stack — the same `@x402` v2 packages, the same receipt format (`embassy-receipt/2`), the same signing scheme.
 
 ## What it does
 
@@ -44,6 +44,7 @@ npm install
 cp .env.example .env   # add X402_CELO_API_KEY from https://x402.celo.org
 npm start              # http://localhost:8787
 npm run smoke          # boots the service and byte-checks the 402 challenge
+npm run test:receipt   # signs a test receipt and verifies it by the documented method below
 ```
 
 Environment:
@@ -66,6 +67,7 @@ To verify a receipt's signature: take the receipt JSON with `signature.value` se
 
 - `src/server.js` — the whole service (surface, x402 flow, receipts).
 - `test/smoke.mjs` — boot + 402-challenge byte check (no payment made).
+- `test/receipt-signature.mjs` — signs a receipt with a throwaway key and verifies it by the documented method.
 - `.env.example` — configuration template. Secrets live in `.env` only, never in this repo.
 
 ## License

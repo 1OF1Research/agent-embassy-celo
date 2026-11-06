@@ -38,7 +38,9 @@ child.stderr.on("data", (d) => (bootLog += d));
 
 try {
   let up = false;
-  for (let i = 0; i < 40 && !up; i++) {
+  // Boot includes a live fetch of the facilitator's /supported table;
+  // on a slow network that can take well over 20s, so the window is 80s.
+  for (let i = 0; i < 160 && !up; i++) {
     try {
       const r = await fetch(`${BASE}/health`);
       up = r.ok;

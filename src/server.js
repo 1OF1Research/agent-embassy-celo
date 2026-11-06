@@ -104,7 +104,8 @@ const VERIFY_DESCRIPTION =
 /* ------------------------------------------------------------------ */
 /* Receipt signing (same scheme as the Embassy's production receipts): */
 /* EIP-191 personal_sign over sha256 of the canonical receipt JSON,    */
-/* with the signature block itself excluded from the hashed bytes.     */
+/* with signature.value nulled in the hashed bytes — signer, key_id,   */
+/* and scheme are hashed in place, exactly as a verifier re-hashes.    */
 /* ------------------------------------------------------------------ */
 
 const SIGNING_KEY_ID = "embassy-receipt-signing-v1";
@@ -117,13 +118,13 @@ if (SIGNING_KEY) {
   }
 }
 
-function canonicalReceiptBytes(receipt) {
+export function canonicalReceiptBytes(receipt) {
   const clone = JSON.parse(JSON.stringify(receipt));
   if (clone.signature) clone.signature.value = null;
   return JSON.stringify(clone);
 }
 
-async function signReceipt(receipt) {
+export async function signReceipt(receipt) {
   if (!signerAccount) {
     receipt.signature = {
       value: null,
@@ -133,14 +134,19 @@ async function signReceipt(receipt) {
     };
     return receipt;
   }
-  const digest = createHash("sha256").update(canonicalReceiptBytes(receipt)).digest();
-  const value = await signerAccount.signMessage({ message: { raw: digest } });
+  /* The block must reach its final shape BEFORE the digest is taken:
+   * a verifier nulls only signature.value and re-hashes, so signer,
+   * key_id, and scheme must already be in place at signing time —
+   * filling them in afterwards changes the bytes and the signature
+   * no longer verifies by the documented method. */
   receipt.signature = {
-    value,
+    value: null,
     signer: signerAccount.address,
     key_id: SIGNING_KEY_ID,
     scheme: "EIP-191 over sha256(canonical receipt, signature.value excluded)",
   };
+  const digest = createHash("sha256").update(canonicalReceiptBytes(receipt)).digest();
+  receipt.signature.value = await signerAccount.signMessage({ message: { raw: digest } });
   return receipt;
 }
 
