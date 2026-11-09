@@ -1,8 +1,19 @@
 /**
  * Agent Embassy on Celo — a pay-per-call verification surface.
  *
- * One paid endpoint: POST /v1/check/verify
- *   Body: { "url": "https://example.com/page" }
+ * Three paid checks, one price (0.001) and one receipt scheme:
+ *   POST /v1/check/verify   { "url": "https://example.com/page" }
+ *     Fetch a URL; return an attestation of what was observed.
+ *   POST /v1/check/ping     { "url": ..., "expect_status": 200, ... }
+ *     Fetch a URL; return a pass/fail attestation against the buyer's
+ *     own conditions (status, body substring, JSON value).
+ *   POST /v1/check/changes  { "url": ..., "known_sha256": "<64 hex>" }
+ *     Fetch a URL; return whether its body SHA-256 differs from the
+ *     hash the buyer supplies. One call, one comparison — not a watch.
+ * Plus a public proof ladder (signer document, receipt reads, a
+ * one-click verify rung) and a discovery shelf (x402.json, OpenAPI,
+ * llms.txt) so any agent or judge can find the surface, call it, and
+ * check every receipt without trusting this server.
  *   Price: 0.001 of a US dollar stablecoin (USA₮ preferred, USDC accepted)
  *   on Celo mainnet (eip155:42220), settled through Celo's hosted x402
  *   facilitator (https://api.x402.celo.org). The buyer signs an EIP-3009
@@ -34,6 +45,7 @@ import {
 } from "@x402/core/server";
 import { ExactEvmScheme } from "@x402/evm/exact/server";
 import { ExpressAdapter } from "@x402/express";
+import { recoverMessageAddress } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
 
 /* ------------------------------------------------------------------ */
@@ -42,6 +54,12 @@ import { privateKeyToAccount } from "viem/accounts";
 
 const PORT = Number(process.env.PORT || 8787);
 const PUBLIC_BASE_URL = (process.env.PUBLIC_BASE_URL || "").replace(/\/$/, "");
+/** This deployment's own public address (the prepared deploy config sets
+ *  PUBLIC_BASE_URL to the same value). Used only as the fallback for
+ *  self-references in the discovery documents — never the production
+ *  service's address: this deployment stands alone. */
+const DEPLOYMENT_URL = "https://agent-embassy-celo.fly.dev";
+const publicBase = () => PUBLIC_BASE_URL || DEPLOYMENT_URL;
 const DATA_DIR = process.env.DATA_DIR || join(process.cwd(), "data");
 const FACILITATOR_API_KEY = process.env.X402_CELO_API_KEY || "";
 const SIGNING_KEY = process.env.EMBASSY_SIGNING_KEY || "";
@@ -101,6 +119,63 @@ const VERIFY_DESCRIPTION =
   "SHA-256 of the body). Price 0.001 USD in USA₮ or USDC on Celo mainnet, " +
   "settled through Celo's hosted x402 facilitator. ERC-8004 agentId 9966.";
 
+const PING_DESCRIPTION =
+  "Agent Embassy conditional URL check on Celo: fetch a URL and return a " +
+  "signed pass/fail attestation against the buyer's own conditions (HTTP " +
+  "status, body substring, JSON value; default condition: status 200). " +
+  "Price 0.001 USD in USA₮ or USDC on Celo mainnet, settled through Celo's " +
+  "hosted x402 facilitator. ERC-8004 agentId 9966.";
+
+const CHANGES_DESCRIPTION =
+  "Agent Embassy URL change comparison on Celo: fetch a URL and return a " +
+  "signed attestation of whether its body SHA-256 differs from a hash the " +
+  "buyer supplies. One call, one comparison — not a standing watch. " +
+  "Price 0.001 USD in USA₮ or USDC on Celo mainnet, settled through Celo's " +
+  "hosted x402 facilitator. ERC-8004 agentId 9966.";
+
+/** The paid shelf: one table drives the x402 routes, the paid handlers,
+ *  the service card, and every discovery document, so the documents a
+ *  stranger reads can never drift from the code that answers. */
+const PAID_ROUTES = [
+  {
+    pattern: "POST /v1/check/verify",
+    path: "/v1/check/verify",
+    action: "url_attestation",
+    description: VERIFY_DESCRIPTION,
+    example: { url: "https://example.com/page" },
+    work: runUrlCheck,
+  },
+  {
+    pattern: "POST /v1/check/ping",
+    path: "/v1/check/ping",
+    action: "url_conditions",
+    description: PING_DESCRIPTION,
+    example: { url: "https://example.com/page", expect_status: 200, expect_body_contains: "Example" },
+    work: runConditionCheck,
+  },
+  {
+    pattern: "POST /v1/check/changes",
+    path: "/v1/check/changes",
+    action: "url_change_comparison",
+    description: CHANGES_DESCRIPTION,
+    example: { url: "https://example.com/page", known_sha256: "<64 hex characters>" },
+    work: runChangesCheck,
+  },
+];
+
+/** The accepts set every paid route offers, in the challenge's own shape. */
+function flatAccepts() {
+  return NET.assets.map((a) => ({
+    scheme: "exact",
+    network: NET.network,
+    asset: a.address,
+    amount: PRICE_SMALLEST_UNIT,
+    payTo: PAY_TO,
+    maxTimeoutSeconds: 300,
+    extra: a.extra,
+  }));
+}
+
 /* ------------------------------------------------------------------ */
 /* Receipt signing (same scheme as the Embassy's production receipts): */
 /* EIP-191 personal_sign over sha256 of the canonical receipt JSON,    */
@@ -152,7 +227,7 @@ export async function signReceipt(receipt) {
 
 /* Hash-chained append-only receipt log (same pattern as production). */
 const RECEIPTS_PATH = join(DATA_DIR, "receipts.jsonl");
-function lastReceiptHash() {
+export function lastReceiptHash() {
   try {
     if (!existsSync(RECEIPTS_PATH)) return "genesis";
     const lines = readFileSync(RECEIPTS_PATH, "utf8").trim().split("\n").filter(Boolean);
@@ -162,60 +237,325 @@ function lastReceiptHash() {
     return "genesis";
   }
 }
-function appendReceipt(receipt) {
+export function appendReceipt(receipt) {
   mkdirSync(DATA_DIR, { recursive: true });
   appendFileSync(RECEIPTS_PATH, JSON.stringify(receipt) + "\n");
 }
 
+/* Receipt writes serialize through one queue. The chain link is only
+ * sound if reading the predecessor hash, signing, and appending happen
+ * as one uninterrupted step: two settlements landing in the same
+ * instant must never read the same predecessor and fork the chain's
+ * linking. The service is single-process by design, so an in-process
+ * queue is the whole mechanism — its scope is named, not implied. */
+let receiptWriteQueue = Promise.resolve();
+export function enqueueReceiptWrite(task) {
+  const run = receiptWriteQueue.then(task, task);
+  receiptWriteQueue = run.catch(() => {});
+  return run;
+}
+
+/* Read side of the log, for the public proof ladder. */
+function readReceiptLines() {
+  try {
+    if (!existsSync(RECEIPTS_PATH)) return [];
+    return readFileSync(RECEIPTS_PATH, "utf8").split("\n").filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+function findReceipt(receiptId) {
+  for (const line of readReceiptLines()) {
+    try {
+      const receipt = JSON.parse(line);
+      if (receipt.receipt_id === receiptId) return { receipt, line };
+    } catch { /* a line that does not parse is skipped, never hidden: the verify rung reports chain state from the raw lines */ }
+  }
+  return null;
+}
+
 /* ------------------------------------------------------------------ */
-/* The work: a URL attestation check.                                  */
+/* The work: one fetch core, three checks.                             */
+/*                                                                     */
+/* Fetch boundary: the checks fetch arbitrary URLs for strangers, so   */
+/* the target is guarded — literal private, loopback, link-local, and  */
+/* shared-space addresses and localhost names are refused, on the      */
+/* first hop and on every redirect hop. The named limit: a public      */
+/* name that resolves to a private address is a resolution-time        */
+/* question this surface does not claim to answer.                     */
 /* ------------------------------------------------------------------ */
 
-async function runUrlCheck(input) {
-  const url = typeof input?.url === "string" ? input.url.trim() : "";
+function ipv4Octets(host) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!m) return null;
+  const octets = m.slice(1).map(Number);
+  return octets.every((o) => o <= 255) ? octets : null;
+}
+function isNonPublicIpv4(o) {
+  return (
+    o[0] === 10 || o[0] === 127 || o[0] === 0 ||
+    (o[0] === 172 && o[1] >= 16 && o[1] <= 31) ||
+    (o[0] === 192 && o[1] === 168) ||
+    (o[0] === 169 && o[1] === 254) ||
+    (o[0] === 100 && o[1] >= 64 && o[1] <= 127)
+  );
+}
+function isNonPublicHost(hostname) {
+  let host = String(hostname || "").toLowerCase();
+  if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1); // URL keeps IPv6 brackets on
+  if (!host) return true;
+  if (host === "localhost" || host.endsWith(".localhost")) return true;
+  const v4 = ipv4Octets(host);
+  if (v4) return isNonPublicIpv4(v4);
+  if (host.includes(":")) {
+    if (host === "::1" || host === "::") return true;
+    if (/^fe[89ab]/.test(host)) return true; // link-local
+    if (/^f[cd]/.test(host)) return true; // unique local
+    const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(host);
+    if (mapped) return isNonPublicIpv4(ipv4Octets(mapped[1]));
+  }
+  return false;
+}
+
+/** Returns an input-error string, or null when the target may be fetched. */
+export function targetProblem(rawUrl) {
+  const url = typeof rawUrl === "string" ? rawUrl.trim() : "";
   let parsed;
   try {
     parsed = new URL(url);
   } catch {
-    return { inputError: "body.url must be a valid absolute URL" };
+    return "body.url must be a valid absolute URL";
   }
-  if (!/^https?:$/.test(parsed.protocol)) {
-    return { inputError: "body.url must use http or https" };
+  if (!/^https?:$/.test(parsed.protocol)) return "body.url must use http or https";
+  if (url.length > 2048) return "body.url is too long (max 2048 chars)";
+  if (isNonPublicHost(parsed.hostname)) {
+    return "body.url must name a public host (private, loopback, and link-local targets are refused)";
   }
-  if (url.length > 2048) return { inputError: "body.url is too long (max 2048 chars)" };
+  return null;
+}
 
+/* One guarded fetch: manual redirects (max 5), each hop re-checked
+ * against the boundary, one 8-second budget across all hops. Returns
+ * { status, buf } for the final response; throws on failure. */
+async function fetchFinal(parsed) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 8000);
+  try {
+    let current = parsed;
+    for (let hop = 0; hop <= 5; hop++) {
+      const resp = await fetch(current.toString(), {
+        signal: ctrl.signal,
+        redirect: "manual",
+        headers: { "user-agent": "AgentEmbassy-Celo/1.0 (+https://aemb.pro)" },
+      });
+      const isRedirect = resp.status >= 300 && resp.status < 400 && resp.headers.get("location");
+      if (!isRedirect) {
+        const buf = Buffer.from(await resp.arrayBuffer());
+        return { status: resp.status, buf, finalUrl: current.toString() };
+      }
+      if (hop === 5) {
+        const err = new Error("too many redirects");
+        err.name = "TooManyRedirects";
+        throw err;
+      }
+      const next = new URL(resp.headers.get("location"), current);
+      if (!/^https?:$/.test(next.protocol) || isNonPublicHost(next.hostname)) {
+        const err = new Error("redirect to a refused target");
+        err.name = "RefusedRedirect";
+        throw err;
+      }
+      current = next;
+    }
+  } finally {
+    clearTimeout(timer);
+  }
+  throw new Error("unreachable fetch state");
+}
+
+/* The shared observation every check is built from. */
+async function fetchObservation(input) {
+  const problem = targetProblem(input?.url);
+  if (problem) return { inputError: problem };
+  const parsed = new URL(input.url.trim());
   const fetchedAt = new Date().toISOString();
   try {
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 8000);
-    const resp = await fetch(parsed.toString(), {
-      signal: ctrl.signal,
-      redirect: "follow",
-      headers: { "user-agent": "AgentEmbassy-Celo/1.0 (+https://aemb.pro)" },
-    });
-    const buf = Buffer.from(await resp.arrayBuffer());
-    clearTimeout(timer);
+    const { status, buf, finalUrl } = await fetchFinal(parsed);
     const observed = buf.subarray(0, 1024 * 1024);
     return {
+      ok: true,
       url: parsed.toString(),
+      final_url: finalUrl,
       reachable: true,
-      http_status: resp.status,
+      http_status: status,
       bytes_observed: observed.length,
       body_sha256: createHash("sha256").update(observed).digest("hex"),
       truncated_at_1mib: buf.length > observed.length,
+      body_text: observed.toString("utf8"),
       fetched_at: fetchedAt,
     };
   } catch (err) {
     return {
+      ok: false,
       url: parsed.toString(),
+      reachable: false,
+      http_status: null,
+      error_class:
+        err?.name === "AbortError" ? "timeout_8s"
+        : err?.name === "TooManyRedirects" ? "too_many_redirects"
+        : err?.name === "RefusedRedirect" ? "redirect_refused"
+        : "fetch_failed",
+      fetched_at: fetchedAt,
+    };
+  }
+}
+
+const publicObservation = (obs) => ({
+  url: obs.url,
+  reachable: obs.reachable,
+  http_status: obs.http_status,
+  bytes_observed: obs.bytes_observed,
+  body_sha256: obs.body_sha256,
+  truncated_at_1mib: obs.truncated_at_1mib,
+  fetched_at: obs.fetched_at,
+});
+
+/* Check 1 — the attestation: what was observed at the URL. */
+async function runUrlCheck(input) {
+  const obs = await fetchObservation(input);
+  if (obs.inputError) return { inputError: obs.inputError };
+  if (!obs.ok) {
+    return {
+      url: obs.url,
       reachable: false,
       http_status: null,
       bytes_observed: 0,
       body_sha256: null,
-      error_class: err?.name === "AbortError" ? "timeout_8s" : "fetch_failed",
-      fetched_at: fetchedAt,
+      error_class: obs.error_class,
+      fetched_at: obs.fetched_at,
     };
   }
+  return publicObservation(obs);
+}
+
+/* Check 2 — the buyer's own conditions on one fetch. */
+const JSON_PATH_SHAPE = /^[\w$-]+(\.[\w$-]+)*$/;
+function readJsonPath(root, path) {
+  let cur = root;
+  for (const part of path.split(".")) {
+    if (cur === null || typeof cur !== "object" || !(part in cur)) return { found: false, value: null };
+    cur = cur[part];
+  }
+  return { found: true, value: cur === undefined ? null : cur };
+}
+export function evaluateConditions(facts, conditions) {
+  const outcomes = {};
+  if (conditions.expect_status !== undefined) {
+    outcomes.status = {
+      expected: conditions.expect_status,
+      observed: facts.http_status,
+      ok: facts.http_status === conditions.expect_status,
+    };
+  }
+  if (conditions.expect_body_contains !== undefined) {
+    outcomes.body_contains = {
+      expected: conditions.expect_body_contains,
+      ok: typeof facts.body_text === "string" && facts.body_text.includes(conditions.expect_body_contains),
+    };
+  }
+  if (conditions.expect_json_path !== undefined) {
+    let parsedBody = null;
+    let parsedOk = true;
+    try {
+      parsedBody = JSON.parse(facts.body_text);
+    } catch {
+      parsedOk = false;
+    }
+    const { found, value } = parsedOk ? readJsonPath(parsedBody, conditions.expect_json_path) : { found: false, value: null };
+    const expected = conditions.expect_json_value === undefined ? null : conditions.expect_json_value;
+    outcomes.json_value = {
+      path: conditions.expect_json_path,
+      expected,
+      observed: found ? value : null,
+      found,
+      body_is_json: parsedOk,
+      ok: found && JSON.stringify(value) === JSON.stringify(expected),
+    };
+  }
+  return { outcomes, pass: Object.values(outcomes).every((o) => o.ok) };
+}
+async function runConditionCheck(input) {
+  const conditions = {};
+  if (input?.expect_status !== undefined) {
+    if (!Number.isInteger(input.expect_status) || input.expect_status < 100 || input.expect_status > 599) {
+      return { inputError: "body.expect_status must be an integer HTTP status (100-599)" };
+    }
+    conditions.expect_status = input.expect_status;
+  }
+  if (input?.expect_body_contains !== undefined) {
+    if (typeof input.expect_body_contains !== "string" || !input.expect_body_contains.length || input.expect_body_contains.length > 512) {
+      return { inputError: "body.expect_body_contains must be a string of 1-512 characters" };
+    }
+    conditions.expect_body_contains = input.expect_body_contains;
+  }
+  if (input?.expect_json_path !== undefined) {
+    if (typeof input.expect_json_path !== "string" || input.expect_json_path.length > 128 || !JSON_PATH_SHAPE.test(input.expect_json_path)) {
+      return { inputError: "body.expect_json_path must be a dotted path of word characters (max 128 chars)" };
+    }
+    conditions.expect_json_path = input.expect_json_path;
+    conditions.expect_json_value = input.expect_json_value === undefined ? null : input.expect_json_value;
+  }
+  if (!Object.keys(conditions).length) conditions.expect_status = 200; // the default condition: the page answers 200
+
+  const obs = await fetchObservation(input);
+  if (obs.inputError) return { inputError: obs.inputError };
+  if (!obs.ok) {
+    return {
+      url: obs.url,
+      reachable: false,
+      http_status: null,
+      conditions_applied: conditions,
+      outcomes: null,
+      pass: false,
+      error_class: obs.error_class,
+      fetched_at: obs.fetched_at,
+    };
+  }
+  const { outcomes, pass } = evaluateConditions(obs, conditions);
+  return {
+    ...publicObservation(obs),
+    conditions_applied: conditions,
+    outcomes,
+    pass,
+  };
+}
+
+/* Check 3 — one comparison against a hash the buyer already holds. */
+async function runChangesCheck(input) {
+  const known = typeof input?.known_sha256 === "string" ? input.known_sha256.trim().toLowerCase() : "";
+  if (!/^[0-9a-f]{64}$/.test(known)) {
+    return { inputError: "body.known_sha256 must be a 64-character hex SHA-256" };
+  }
+  const obs = await fetchObservation(input);
+  if (obs.inputError) return { inputError: obs.inputError };
+  if (!obs.ok) {
+    return {
+      url: obs.url,
+      reachable: false,
+      http_status: null,
+      known_sha256: known,
+      current_sha256: null,
+      changed: null,
+      error_class: obs.error_class,
+      fetched_at: obs.fetched_at,
+    };
+  }
+  return {
+    ...publicObservation(obs),
+    known_sha256: known,
+    current_sha256: obs.body_sha256,
+    changed: obs.body_sha256 !== known,
+    hash_scope: obs.truncated_at_1mib ? "first_1mib" : "full_body",
+  };
 }
 
 /* ------------------------------------------------------------------ */
@@ -234,8 +574,9 @@ function buildHttpServer() {
     NET.network,
     new ExactEvmScheme(),
   );
-  const routes = {
-    "POST /v1/check/verify": {
+  const routes = {};
+  for (const route of PAID_ROUTES) {
+    routes[route.pattern] = {
       accepts: NET.assets.map((a) => ({
         scheme: "exact",
         network: NET.network,
@@ -243,10 +584,10 @@ function buildHttpServer() {
         price: { asset: a.address, amount: PRICE_SMALLEST_UNIT, extra: a.extra },
         maxTimeoutSeconds: 300,
       })),
-      description: VERIFY_DESCRIPTION,
+      description: route.description,
       mimeType: "application/json",
-    },
-  };
+    };
+  }
   return new x402HTTPResourceServer(resourceServer, routes);
 }
 
@@ -269,6 +610,8 @@ export async function createApp() {
       facilitator: NET.facilitatorUrl,
       facilitator_key_configured: Boolean(FACILITATOR_API_KEY),
       receipt_signing_configured: Boolean(signerAccount),
+      receipts_count: readReceiptLines().length,
+      receipt_chain_head: lastReceiptHash(),
       agent_id: AGENT_ID,
       pay_to: PAY_TO,
     });
@@ -287,16 +630,26 @@ export async function createApp() {
       pay_to: PAY_TO,
       network: NET.network,
       facilitator: NET.facilitatorUrl,
-      endpoints: [
-        {
-          method: "POST",
-          path: "/v1/check/verify",
-          price: "0.001 USD",
-          assets: NET.assets.map((a) => ({ symbol: a.symbol, address: a.address })),
-          body: { url: "https://example.com/page" },
-          returns: "URL attestation + signed Embassy receipt",
-        },
-      ],
+      endpoints: PAID_ROUTES.map((r) => ({
+        method: "POST",
+        path: r.path,
+        price: "0.001 USD",
+        assets: NET.assets.map((a) => ({ symbol: a.symbol, address: a.address })),
+        body: r.example,
+        returns: "Check result + signed Embassy receipt",
+      })),
+      proof: {
+        signer: `${publicBase()}/.well-known/embassy-signer.json`,
+        receipts: `${publicBase()}/v1/receipts`,
+        verify: `${publicBase()}/v1/receipts/<receipt_id>/verify`,
+        proof_page: `${publicBase()}/proof`,
+      },
+      discovery: {
+        x402: `${publicBase()}/.well-known/x402.json`,
+        openapi: `${publicBase()}/openapi.json`,
+        llms: `${publicBase()}/llms.txt`,
+        agent_card: `${publicBase()}/.well-known/agent.json`,
+      },
       attribution:
         "ERC-8021 via PayTo address for x402, per the Agents on Open Rails rules (attribution tags are not yet supported by x402).",
     });
@@ -309,13 +662,13 @@ export async function createApp() {
       description:
         "Agent Embassy — agents pay for work and prove what happened. Every check returns a signed outcome receipt. This is the Celo deployment.",
       services: [
-        { name: "web", endpoint: PUBLIC_BASE_URL || "https://aemb.pro" },
-        {
+        { name: "web", endpoint: publicBase() },
+        ...PAID_ROUTES.map((r) => ({
           name: "x402",
-          endpoint: `${PUBLIC_BASE_URL || ""}/v1/check/verify`,
+          endpoint: `${publicBase()}${r.path}`,
           version: "2",
           network: NET.network,
-        },
+        })),
         { name: "email", endpoint: "mailto:agent.embassy@proton.me" },
       ],
       x402Support: true,
@@ -327,16 +680,250 @@ export async function createApp() {
     });
   });
 
-  /* The paid route — manual HTTP-server flow so the receipt can carry the
-   * real settlement transaction hash: verify -> work -> settle -> receipt. */
-  app.post("/v1/check/verify", async (req, res) => {
+  /* ---------------------------------------------------------------- */
+  /* The proof ladder — public, read-only, no payment. Each rung lets  */
+  /* a stranger check one claim without trusting this server: the      */
+  /* signer is published outside the receipts; a receipt's signature   */
+  /* and chain link are re-derived on request; the settlement itself   */
+  /* is read on the chain explorer.                                    */
+  /* ---------------------------------------------------------------- */
+
+  app.get("/.well-known/embassy-signer.json", (_req, res) => {
+    res.json({
+      signer: signerAccount?.address ?? null,
+      key_id: SIGNING_KEY_ID,
+      scheme: "EIP-191 over sha256(canonical receipt, signature.value excluded)",
+      receipt_version: "embassy-receipt/2",
+      signing_configured: Boolean(signerAccount),
+      how_to_verify: [
+        "Take the receipt JSON with signature.value set to null.",
+        "SHA-256 the compact JSON.",
+        "ecrecover the EIP-191 signature over that digest.",
+        "The recovered address must equal the receipt's signature.signer and the signer published here.",
+      ],
+      receipts: `${publicBase()}/v1/receipts`,
+      verify_endpoint: `${publicBase()}/v1/receipts/<receipt_id>/verify`,
+    });
+  });
+
+  app.get("/v1/receipts", (_req, res) => {
+    const receipts = [];
+    for (const line of readReceiptLines()) {
+      try {
+        receipts.push(JSON.parse(line));
+      } catch { /* unparseable lines are skipped here; the verify rung reports chain state from the raw lines */ }
+    }
+    res.json({ count: receipts.length, receipts: receipts.slice(-25).reverse() });
+  });
+
+  app.get("/v1/receipts/:receiptId", (req, res) => {
+    const found = findReceipt(req.params.receiptId);
+    if (!found) return res.status(404).json({ error: "receipt_not_found" });
+    return res.json(found.receipt);
+  });
+
+  app.get("/v1/receipts/:receiptId/verify", async (req, res) => {
+    const found = findReceipt(req.params.receiptId);
+    if (!found) return res.status(404).json({ error: "receipt_not_found" });
+    const { receipt, line } = found;
+    const verdict = {
+      receipt_id: receipt.receipt_id,
+      network: NET.network,
+      published_signer: signerAccount?.address ?? null,
+      recovered_signer: null,
+      signature_valid: false,
+      chain_link_valid: false,
+      settlement_tx: receipt.chain?.PROOF?.settlement_tx ?? null,
+      explorer: receipt.chain?.PROOF?.explorer ?? null,
+    };
+    if (receipt.signature?.value && receipt.signature?.signer) {
+      try {
+        const digest = createHash("sha256").update(canonicalReceiptBytes(receipt)).digest();
+        verdict.recovered_signer = await recoverMessageAddress({
+          message: { raw: digest },
+          signature: receipt.signature.value,
+        });
+        verdict.signature_valid =
+          verdict.recovered_signer === receipt.signature.signer &&
+          (!verdict.published_signer || verdict.recovered_signer === verdict.published_signer);
+      } catch {
+        verdict.signature_valid = false;
+      }
+    } else {
+      verdict.signature_note = "this receipt is unsigned (no signing key was configured when it was issued)";
+    }
+    const lines = readReceiptLines();
+    const idx = lines.indexOf(line);
+    if (idx >= 0) {
+      const expectedPrev =
+        idx === 0 ? "genesis" : createHash("sha256").update(lines[idx - 1]).digest("hex");
+      verdict.chain_link_valid = receipt.prev_receipt_hash === expectedPrev;
+    }
+    if (!verdict.explorer && verdict.settlement_tx) verdict.explorer = NET.explorerTx(verdict.settlement_tx);
+    return res.json(verdict);
+  });
+
+  app.get("/proof", (_req, res) => {
+    res.type("html").send(`<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Proof — Agent Embassy on Celo</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Inter, sans-serif; max-width: 640px; margin: 40px auto; padding: 0 20px; line-height: 1.6; color: #111; }
+  input { width: 100%; padding: 10px; font-size: 15px; border: 1px solid #ccc; border-radius: 8px; }
+  button { margin-top: 10px; padding: 10px 18px; font-size: 15px; font-weight: 600; border: 0; border-radius: 8px; background: #111; color: #fff; cursor: pointer; }
+  .card { border: 1px solid #e5e5e5; border-radius: 10px; padding: 14px 16px; margin-top: 14px; }
+  .ok { color: #15803d; font-weight: 700; } .bad { color: #b91c1c; font-weight: 700; }
+  code { font-size: 12px; word-break: break-all; }
+  li { margin: 6px 0; } a { color: #111; }
+</style>
+</head>
+<body>
+<h1>Check a receipt</h1>
+<p>Every paid call on this service returns a signed receipt. Paste a receipt id below and this page re-checks its signature and its place in the receipt chain — the same checks anyone can run by hand from the published signer document. The payment itself is read on the chain explorer.</p>
+<input id="rid" placeholder="receipt id">
+<button id="go">Verify</button>
+<div id="out"></div>
+<h2>Recent receipts</h2>
+<ul id="recent"></ul>
+<script>
+  const out = document.getElementById("out");
+  async function verify(id) {
+    out.innerHTML = "<p>Checking…</p>";
+    try {
+      const r = await fetch("/v1/receipts/" + encodeURIComponent(id) + "/verify");
+      if (!r.ok) { out.innerHTML = "<p class='bad'>No receipt with that id.</p>"; return; }
+      const v = await r.json();
+      const mark = (b) => b ? "<span class='ok'>holds</span>" : "<span class='bad'>does not hold</span>";
+      out.innerHTML = "<div class='card'>" +
+        "<p>Signature: " + mark(v.signature_valid) + "</p>" +
+        "<p>Chain link: " + mark(v.chain_link_valid) + "</p>" +
+        (v.settlement_tx ? "<p>Settlement: <a href='" + v.explorer + "' target='_blank' rel='noopener'>read it on Celoscan</a></p>" : "<p>No settlement transaction on this receipt.</p>") +
+        "<p><code>signer " + (v.recovered_signer || "—") + "</code></p></div>";
+    } catch (e) { out.innerHTML = "<p class='bad'>The check could not run.</p>"; }
+  }
+  document.getElementById("go").addEventListener("click", () => verify(document.getElementById("rid").value.trim()));
+  fetch("/v1/receipts").then((r) => r.json()).then((d) => {
+    const ul = document.getElementById("recent");
+    (d.receipts || []).slice(0, 10).forEach((rec) => {
+      const li = document.createElement("li");
+      const a = document.createElement("a");
+      a.href = "#"; a.textContent = rec.receipt_id;
+      a.addEventListener("click", (e) => { e.preventDefault(); document.getElementById("rid").value = rec.receipt_id; verify(rec.receipt_id); });
+      li.appendChild(a);
+      ul.appendChild(li);
+    });
+    if (!d.count) ul.innerHTML = "<li>No receipts yet — the first settled call will appear here.</li>";
+  }).catch(() => {});
+</script>
+</body>
+</html>`);
+  });
+
+  /* ---------------------------------------------------------------- */
+  /* The discovery shelf — generated from PAID_ROUTES, so what an      */
+  /* agent reads can never drift from what the server answers.         */
+  /* ---------------------------------------------------------------- */
+
+  app.get("/.well-known/x402.json", (_req, res) => {
+    res.json({
+      x402Version: 2,
+      resources: PAID_ROUTES.map((r) => ({
+        resource: `${publicBase()}${r.path}`,
+        type: "http",
+        method: "POST",
+        mimeType: "application/json",
+        description: r.description,
+        accepts: flatAccepts(),
+      })),
+    });
+  });
+
+  app.get("/openapi.json", (_req, res) => {
+    const paidPaths = {};
+    for (const r of PAID_ROUTES) {
+      paidPaths[r.path] = {
+        post: {
+          summary: r.description,
+          requestBody: {
+            content: { "application/json": { example: r.example } },
+          },
+          responses: {
+            "200": { description: "Check result plus a signed Embassy receipt (embassy-receipt/2)." },
+            "402": { description: "x402 v2 payment challenge (PAYMENT-REQUIRED header and mirrored body); accepts USA₮ and USDC on eip155:42220." },
+            "422": { description: "Input refused after payment verification; the authorization is cancelled, nothing settles." },
+          },
+        },
+      };
+    }
+    res.json({
+      openapi: "3.0.3",
+      info: {
+        title: "Agent Embassy on Celo",
+        version: "1.0.0",
+        description:
+          "Pay-per-call verification settled in USA₮ or USDC on Celo mainnet through Celo's hosted x402 facilitator. Every settled call returns a signed receipt anyone can verify. ERC-8004 agentId 9966.",
+      },
+      servers: [{ url: publicBase() }],
+      paths: {
+        "/health": { get: { summary: "Liveness, configuration, and receipt-chain state.", responses: { "200": { description: "Service state." } } } },
+        "/": { get: { summary: "Service card: endpoints, prices, proof ladder, discovery links.", responses: { "200": { description: "Service card." } } } },
+        "/.well-known/agent.json": { get: { summary: "ERC-8004 agent card for this deployment.", responses: { "200": { description: "Agent card." } } } },
+        "/.well-known/embassy-signer.json": { get: { summary: "The receipt signer's published address and the verification recipe.", responses: { "200": { description: "Signer document." } } } },
+        "/.well-known/x402.json": { get: { summary: "x402 machine-readable discovery document.", responses: { "200": { description: "Discovery document." } } } },
+        "/v1/receipts": { get: { summary: "Recent receipts (public).", responses: { "200": { description: "Receipt list." } } } },
+        "/v1/receipts/{receiptId}": { get: { summary: "One receipt in full.", responses: { "200": { description: "Receipt." }, "404": { description: "No such receipt." } } } },
+        "/v1/receipts/{receiptId}/verify": { get: { summary: "Re-derived signature and chain-link verdicts for one receipt.", responses: { "200": { description: "Verdicts." }, "404": { description: "No such receipt." } } } },
+        "/proof": { get: { summary: "Human proof page: check any receipt in one click.", responses: { "200": { description: "HTML page." } } } },
+        ...paidPaths,
+      },
+    });
+  });
+
+  app.get("/llms.txt", (_req, res) => {
+    const lines = [
+      "# Agent Embassy on Celo",
+      "",
+      "Pay-per-call verification for agents, settled on Celo mainnet (eip155:42220) through Celo's hosted x402 facilitator. No account, no subscription: pay 0.001 per call in USA₮ (preferred) or USDC, receive the check result plus a signed receipt (embassy-receipt/2) carrying the settlement transaction hash.",
+      "",
+      "Identity: ERC-8004 agentId 9966 on Celo mainnet. PayTo (also the ERC-8021 attribution for x402): " + PAY_TO + ".",
+      "",
+      "## Paid endpoints (x402 v2, scheme exact)",
+      ...PAID_ROUTES.flatMap((r) => [
+        "",
+        "### POST " + r.path,
+        r.description,
+        "Example body: " + JSON.stringify(r.example),
+      ]),
+      "",
+      "## How to pay",
+      "Send the POST without payment to receive the 402 challenge (the full requirements ride both the PAYMENT-REQUIRED header and the body). Sign an EIP-3009 authorization for one of the offered assets and retry with the PAYMENT-SIGNATURE header. The facilitator settles and pays the gas; funds move from buyer to PayTo directly.",
+      "",
+      "## How to verify a receipt",
+      "Signer document: " + publicBase() + "/.well-known/embassy-signer.json",
+      "One-click verdicts: GET " + publicBase() + "/v1/receipts/<receipt_id>/verify",
+      "By hand: set signature.value to null, SHA-256 the compact JSON, ecrecover the EIP-191 signature over that digest; the recovered address must equal signature.signer. The settlement is read independently on Celoscan from chain.PROOF.settlement_tx.",
+      "",
+      "Discovery: " + publicBase() + "/.well-known/x402.json · " + publicBase() + "/openapi.json · " + publicBase() + "/.well-known/agent.json",
+      "",
+    ];
+    res.type("text/plain").send(lines.join("\n"));
+  });
+
+  /* The paid routes — manual HTTP-server flow so the receipt can carry the
+   * real settlement transaction hash: verify -> work -> settle -> receipt.
+   * One handler factory serves the whole PAID_ROUTES table; the flow is
+   * identical per route, only the work function and receipt labels differ. */
+  const paidHandler = (route) => async (req, res) => {
     const context = {
       adapter: new ExpressAdapter(req),
       path: req.path,
       method: req.method,
       paymentHeader:
         req.header("payment-signature") || req.header("x-payment") || undefined,
-      routePattern: "POST /v1/check/verify",
+      routePattern: route.pattern,
     };
 
     let processed;
@@ -367,7 +954,7 @@ export async function createApp() {
     }
 
     /* Verified — do the work BEFORE settling, so a bad input never settles. */
-    const work = await runUrlCheck(req.body || {});
+    const work = await route.work(req.body || {});
     if (work.inputError) {
       try {
         await processed.cancellationDispatcher?.cancel({ reason: "invalid_input" });
@@ -402,7 +989,7 @@ export async function createApp() {
     const receipt = {
       receipt_version: "embassy-receipt/2",
       receipt_id: randomUUID(),
-      prev_receipt_hash: lastReceiptHash(),
+      prev_receipt_hash: null, // assigned inside the serialized write below, before signing
       issued_at: new Date().toISOString(),
       issuer: {
         name: "Agent Embassy",
@@ -412,7 +999,7 @@ export async function createApp() {
       },
       chain: {
         REQUEST: {
-          endpoint: "POST /v1/check/verify",
+          endpoint: route.pattern,
           input_sha256: createHash("sha256").update(JSON.stringify(req.body || {})).digest("hex"),
         },
         AUTHORIZATION: {
@@ -423,7 +1010,7 @@ export async function createApp() {
           amount: processed.paymentRequirements.amount,
           authorization_nonce: auth.nonce || null,
         },
-        ACTION: { check: "url_attestation", result: work },
+        ACTION: { check: route.action, result: work },
         PROOF: {
           settlement_tx: settle.transaction,
           facilitator: NET.facilitatorUrl,
@@ -434,11 +1021,23 @@ export async function createApp() {
       },
       signature: { value: null, signer: null, key_id: SIGNING_KEY_ID, scheme: null },
     };
-    await signReceipt(receipt);
-    appendReceipt(receipt);
+    /* Assign the chain link, sign, and append as one serialized step —
+     * the signature covers prev_receipt_hash, so the link must be final
+     * before the digest is taken, and no other settlement may interleave. */
+    try {
+      await enqueueReceiptWrite(async () => {
+        receipt.prev_receipt_hash = lastReceiptHash();
+        await signReceipt(receipt);
+        appendReceipt(receipt);
+      });
+    } catch (err) {
+      console.error("receipt write failed:", err?.message || err);
+    }
 
     return res.json({ result: work, receipt });
-  });
+  };
+
+  for (const route of PAID_ROUTES) app.post(route.path, paidHandler(route));
 
   return app;
 }

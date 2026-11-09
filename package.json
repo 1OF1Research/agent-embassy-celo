@@ -16,7 +16,10 @@
   "scripts": {
     "smoke": "node test/smoke.mjs",
     "start": "node src/server.js",
-    "test:receipt": "node test/receipt-signature.mjs"
+    "test:receipt": "node test/receipt-signature.mjs",
+    "test:logic": "node test/check-logic.mjs",
+    "test:ladder": "node test/proof-ladder.mjs",
+    "test:discovery": "node test/discovery.mjs"
   },
   "type": "module",
   "version": "1.0.0"
