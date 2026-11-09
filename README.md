@@ -51,7 +51,7 @@ Environment:
 
 | Variable | Meaning |
 | --- | --- |
-| `X402_CELO_API_KEY` | Facilitator API key (sign a message at x402.celo.org; free tier includes up to 20 mainnet settlements, 1000 on testnet). Needed for settlement; the 402 challenge works without it. |
+| `X402_CELO_API_KEY` | Facilitator API key (sign a message at x402.celo.org; free tier includes up to 100 mainnet credits (facilitator's pricing page, read 2026-11-08; the venue FAQ still states 20), 1000 on testnet). Needed for settlement; the 402 challenge works without it. |
 | `EMBASSY_SIGNING_KEY` | Dedicated receipt-signing key (statements only, cannot move funds). Without it, receipts are issued unsigned and say so. |
 | `CELO_NETWORK` | `mainnet` (default) or `sepolia` (testnet rehearsal; USDC only). |
 | `PUBLIC_BASE_URL` | Public URL of this deployment, used in the agent card. |

@@ -354,7 +354,8 @@ export async function createApp() {
        * header readers and body readers — sees the full requirements. */
       let out = body;
       const hdr = headers?.["payment-required"] || headers?.["PAYMENT-REQUIRED"];
-      if (hdr && (!out || (typeof out === "object" && !Object.keys(out).length))) {
+      const stubOnly = out && typeof out === "object" && !Array.isArray(out) && Object.keys(out).length === 1 && typeof out.error === "string" && !out.accepts;
+      if (hdr && (!out || (typeof out === "object" && !Object.keys(out).length) || stubOnly)) {
         try {
           out = JSON.parse(Buffer.from(hdr, "base64").toString("utf8"));
         } catch { /* keep the original body */ }
