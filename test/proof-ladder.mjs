@@ -121,7 +121,7 @@ try {
 
   const signerDoc = await (await fetch(`${BASE}/.well-known/embassy-signer.json`)).json();
   check("signer document publishes the configured signer", signerDoc.signer === expectedSigner, signerDoc.signer || "null");
-  check("signer document names the key id", signerDoc.key_id === "embassy-receipt-signing-v1");
+  check("signer document names the key id", signerDoc.key_id === "embassy-receipt-signing-celo-v1");
 
   const health = await (await fetch(`${BASE}/health`)).json();
   check("health counts the seeded receipts", health.receipts_count === 3, `got ${health.receipts_count}`);

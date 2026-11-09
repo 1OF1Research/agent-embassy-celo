@@ -183,7 +183,10 @@ function flatAccepts() {
 /* and scheme are hashed in place, exactly as a verifier re-hashes.    */
 /* ------------------------------------------------------------------ */
 
-const SIGNING_KEY_ID = "embassy-receipt-signing-v1";
+/* This deployment signs with its own dedicated key, separate from the
+ * production receipt signer: a new key takes a new key_id, so no two
+ * keys ever share one name across the Embassy's surfaces. */
+const SIGNING_KEY_ID = "embassy-receipt-signing-celo-v1";
 let signerAccount = null;
 if (SIGNING_KEY) {
   try {
