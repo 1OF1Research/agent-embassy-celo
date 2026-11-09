@@ -22,8 +22,14 @@ import { join } from "node:path";
 
 process.env.DATA_DIR = mkdtempSync(join(tmpdir(), "celo-logic-"));
 
-const { targetProblem, evaluateConditions, enqueueReceiptWrite, lastReceiptHash, appendReceipt } =
-  await import("../src/server.js");
+const {
+  targetProblem,
+  evaluateConditions,
+  enqueueReceiptWrite,
+  lastReceiptHash,
+  appendReceipt,
+  readBodyCapped,
+} = await import("../src/server.js");
 
 let failures = 0;
 function check(label, ok, detail = "") {
@@ -46,6 +52,17 @@ check("192.168.x is refused", targetProblem("http://192.168.1.1/") !== null);
 check("169.254.x (link-local) is refused", targetProblem("http://169.254.169.254/latest/meta-data") !== null);
 check("100.64.x (shared space) is refused", targetProblem("http://100.64.0.1/") !== null);
 check("[::1] is refused", targetProblem("http://[::1]/") !== null);
+/* The same refused addresses in their other spellings — the URL parser
+ * rewrites a dotted mapped tail as hex groups, so both spellings are
+ * asserted, plus the IPv4-compatible form and a mapped link-local. */
+check("[::ffff:127.0.0.1] (mapped loopback, dotted) is refused", targetProblem("http://[::ffff:127.0.0.1]/") !== null);
+check("[::ffff:7f00:1] (mapped loopback, hex) is refused", targetProblem("http://[::ffff:7f00:1]/") !== null);
+check("[::ffff:a9fe:a9fe] (mapped link-local) is refused", targetProblem("http://[::ffff:a9fe:a9fe]/") !== null);
+check("[::7f00:1] (IPv4-compatible loopback) is refused", targetProblem("http://[::7f00:1]/") !== null);
+check("[fe80::1] (link-local) is refused", targetProblem("http://[fe80::1]/") !== null);
+check("[fd00::1] (unique local) is refused", targetProblem("http://[fd00::1]/") !== null);
+check("public IPv6 passes", targetProblem("https://[2606:4700:4700::1111]/") === null);
+check("mapped public IPv4 passes", targetProblem("http://[::ffff:808:808]/") === null);
 
 /* 2 — the condition evaluator */
 const facts = {
@@ -92,6 +109,34 @@ for (let i = 0; i < lines.length; i++) {
   if (JSON.parse(lines[i]).prev_receipt_hash !== expected) chainOk = false;
 }
 check("the chain never forked under parallel writes", chainOk);
+
+/* 4 — the capped body read: the 1 MiB observation cap holds while
+ * streaming, and the kept bytes are exactly the body's first 1 MiB. */
+{
+  const small = new Response(new Blob(["hello"]));
+  const r1 = await readBodyCapped(small);
+  check("small body reads whole, not truncated", r1.buf.toString() === "hello" && r1.truncated === false);
+
+  const big = new Uint8Array(3 * 1024 * 1024);
+  for (let i = 0; i < big.length; i++) big[i] = i % 251;
+  const stream = new ReadableStream({
+    start(controller) {
+      for (let off = 0; off < big.length; off += 65536) controller.enqueue(big.subarray(off, off + 65536));
+      controller.close();
+    },
+  });
+  const r2 = await readBodyCapped(new Response(stream));
+  check("oversized body is capped at 1 MiB", r2.buf.length === 1024 * 1024, `${r2.buf.length} bytes kept`);
+  check("oversized body reports truncated", r2.truncated === true);
+  check(
+    "kept bytes are the body's first 1 MiB",
+    createHash("sha256").update(r2.buf).digest("hex") ===
+      createHash("sha256").update(big.subarray(0, 1024 * 1024)).digest("hex"),
+  );
+
+  const empty = await readBodyCapped(new Response(null));
+  check("empty body reads empty, not truncated", empty.buf.length === 0 && empty.truncated === false);
+}
 
 console.log(failures === 0 ? "\nCHECK LOGIC: ALL PASS" : `\nCHECK LOGIC: ${failures} FAILURES`);
 process.exit(failures === 0 ? 0 : 1);

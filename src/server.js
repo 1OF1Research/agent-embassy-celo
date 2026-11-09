@@ -279,10 +279,12 @@ function findReceipt(receiptId) {
 /*                                                                     */
 /* Fetch boundary: the checks fetch arbitrary URLs for strangers, so   */
 /* the target is guarded — literal private, loopback, link-local, and  */
-/* shared-space addresses and localhost names are refused, on the      */
-/* first hop and on every redirect hop. The named limit: a public      */
-/* name that resolves to a private address is a resolution-time        */
-/* question this surface does not claim to answer.                     */
+/* shared-space addresses and localhost names are refused, in every    */
+/* spelling (IPv6 literals are judged in expanded form, so IPv4-mapped */
+/* and IPv4-compatible spellings of a refused address are refused      */
+/* too), on the first hop and on every redirect hop. The named limit:  */
+/* a public name that resolves to a private address is a               */
+/* resolution-time question this surface does not claim to answer.     */
 /* ------------------------------------------------------------------ */
 
 function ipv4Octets(host) {
@@ -300,6 +302,37 @@ function isNonPublicIpv4(o) {
     (o[0] === 100 && o[1] >= 64 && o[1] <= 127)
   );
 }
+/* Expand an IPv6 literal (compressed, with an optional embedded IPv4
+ * tail) to its eight 16-bit groups, or null when it does not parse.
+ * The fetch boundary judges the expanded form only: the URL parser
+ * rewrites spellings (a dotted mapped tail comes back as hex groups),
+ * so a check written against one spelling silently misses the others —
+ * ::ffff:127.0.0.1 and ::ffff:7f00:1 are the same loopback address. */
+function expandIpv6(host) {
+  let h = host;
+  const tail = /(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(h);
+  if (tail) {
+    const o = tail.slice(1).map(Number);
+    if (o.some((n) => n > 255)) return null;
+    h =
+      h.slice(0, h.length - tail[0].length) +
+      ((o[0] << 8) | o[1]).toString(16) +
+      ":" +
+      ((o[2] << 8) | o[3]).toString(16);
+  }
+  const halves = h.split("::");
+  if (halves.length > 2) return null;
+  const parse = (s) =>
+    s === "" ? [] : s.split(":").map((g) => (/^[0-9a-f]{1,4}$/.test(g) ? parseInt(g, 16) : NaN));
+  const left = parse(halves[0]);
+  const right = halves.length === 2 ? parse(halves[1]) : [];
+  if (left.some(Number.isNaN) || right.some(Number.isNaN)) return null;
+  if (halves.length === 1) return left.length === 8 ? left : null;
+  const missing = 8 - left.length - right.length;
+  if (missing < 1) return null;
+  return [...left, ...Array(missing).fill(0), ...right];
+}
+
 function isNonPublicHost(hostname) {
   let host = String(hostname || "").toLowerCase();
   if (host.startsWith("[") && host.endsWith("]")) host = host.slice(1, -1); // URL keeps IPv6 brackets on
@@ -308,11 +341,17 @@ function isNonPublicHost(hostname) {
   const v4 = ipv4Octets(host);
   if (v4) return isNonPublicIpv4(v4);
   if (host.includes(":")) {
-    if (host === "::1" || host === "::") return true;
-    if (/^fe[89ab]/.test(host)) return true; // link-local
-    if (/^f[cd]/.test(host)) return true; // unique local
-    const mapped = /^::ffff:(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(host);
-    if (mapped) return isNonPublicIpv4(ipv4Octets(mapped[1]));
+    const v6 = expandIpv6(host);
+    if (!v6) return true; // an IPv6 literal that does not parse is refused, never waved through
+    if (v6.every((g) => g === 0)) return true; // :: — the unspecified address
+    /* IPv4-mapped (::ffff:a.b.c.d, in any spelling) and IPv4-compatible
+     * (::a.b.c.d, which also covers ::1): the embedded IPv4 decides. */
+    if (v6.slice(0, 5).every((g) => g === 0) && (v6[5] === 0xffff || v6[5] === 0)) {
+      return isNonPublicIpv4([v6[6] >> 8, v6[6] & 0xff, v6[7] >> 8, v6[7] & 0xff]);
+    }
+    if (v6[0] >= 0xfe80 && v6[0] <= 0xfebf) return true; // link-local fe80::/10
+    if (v6[0] >= 0xfc00 && v6[0] <= 0xfdff) return true; // unique local fc00::/7
+    if (v6[0] >= 0xff00) return true; // multicast ff00::/8 — never a fetch target
   }
   return false;
 }
@@ -334,9 +373,46 @@ export function targetProblem(rawUrl) {
   return null;
 }
 
+/* The observation is capped at 1 MiB, and the cap is enforced while
+ * reading — never after: a response body is streamed and the read is
+ * cancelled the moment the cap is crossed, so a hostile or broken
+ * target cannot make this service buffer an unbounded body in memory
+ * (the work runs after payment verification but before settlement, so
+ * an unbounded read would be a crash a stranger could trigger at no
+ * settled cost). Returns the first MAX_OBSERVED bytes and whether the
+ * body held more. */
+const MAX_OBSERVED = 1024 * 1024;
+export async function readBodyCapped(resp) {
+  if (!resp.body) return { buf: Buffer.alloc(0), truncated: false };
+  const reader = resp.body.getReader();
+  const chunks = [];
+  let kept = 0;
+  let truncated = false;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (kept + value.length > MAX_OBSERVED) {
+        const room = MAX_OBSERVED - kept;
+        if (room > 0) chunks.push(value.subarray(0, room));
+        kept = MAX_OBSERVED;
+        truncated = true;
+        await reader.cancel();
+        break;
+      }
+      chunks.push(value);
+      kept += value.length;
+    }
+  } finally {
+    reader.releaseLock();
+  }
+  return { buf: Buffer.concat(chunks, kept), truncated };
+}
+
 /* One guarded fetch: manual redirects (max 5), each hop re-checked
  * against the boundary, one 8-second budget across all hops. Returns
- * { status, buf } for the final response; throws on failure. */
+ * { status, buf, truncated } for the final response — buf never holds
+ * more than the 1 MiB observation cap; throws on failure. */
 async function fetchFinal(parsed) {
   const ctrl = new AbortController();
   const timer = setTimeout(() => ctrl.abort(), 8000);
@@ -350,8 +426,8 @@ async function fetchFinal(parsed) {
       });
       const isRedirect = resp.status >= 300 && resp.status < 400 && resp.headers.get("location");
       if (!isRedirect) {
-        const buf = Buffer.from(await resp.arrayBuffer());
-        return { status: resp.status, buf, finalUrl: current.toString() };
+        const { buf, truncated } = await readBodyCapped(resp);
+        return { status: resp.status, buf, truncated, finalUrl: current.toString() };
       }
       if (hop === 5) {
         const err = new Error("too many redirects");
@@ -379,18 +455,17 @@ async function fetchObservation(input) {
   const parsed = new URL(input.url.trim());
   const fetchedAt = new Date().toISOString();
   try {
-    const { status, buf, finalUrl } = await fetchFinal(parsed);
-    const observed = buf.subarray(0, 1024 * 1024);
+    const { status, buf, truncated, finalUrl } = await fetchFinal(parsed);
     return {
       ok: true,
       url: parsed.toString(),
       final_url: finalUrl,
       reachable: true,
       http_status: status,
-      bytes_observed: observed.length,
-      body_sha256: createHash("sha256").update(observed).digest("hex"),
-      truncated_at_1mib: buf.length > observed.length,
-      body_text: observed.toString("utf8"),
+      bytes_observed: buf.length,
+      body_sha256: createHash("sha256").update(buf).digest("hex"),
+      truncated_at_1mib: truncated,
+      body_text: buf.toString("utf8"),
       fetched_at: fetchedAt,
     };
   } catch (err) {
