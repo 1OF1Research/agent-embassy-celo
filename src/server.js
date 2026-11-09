@@ -21,9 +21,13 @@
  *   buyer -> payTo directly. Every settled call returns the check result
  *   plus a signed Embassy receipt (embassy-receipt/2 shape).
  *
- * Identity: ERC-8004 agentId 9966 on Celo mainnet, registry
- * 0x8004A169FB4a3325136EB29fA0ceB6D2e539a432, agent card
- * https://aemb.pro/agent.json (tokenURI of 9966, verified onchain).
+ * Identity: optional and configured, never compiled in. Set AGENT_ID
+ * to your own ERC-8004 agent number and this deployment presents it —
+ * in its check descriptions, its agent card, its service card, and its
+ * receipts. Set REQUIRE_AGENT_ID=on and the deployment goes further:
+ * it then refuses any paying customer who cannot prove the agent
+ * number they present is theirs (the gate, below). Out of the box
+ * neither is set: no identity is presented and the service is open.
  *
  * Attribution (ERC-8021): the hackathon's rule for x402 is that attribution
  * rides the PayTo address, because x402 does not yet support attribution
@@ -65,12 +69,34 @@ const FACILITATOR_API_KEY = process.env.X402_CELO_API_KEY || "";
 const SIGNING_KEY = process.env.EMBASSY_SIGNING_KEY || "";
 const NETWORK_MODE = (process.env.CELO_NETWORK || "mainnet").toLowerCase();
 
-/** The Embassy's operating wallet — payTo on every chain, and the owner of
- *  ERC-8004 agentId 9966 on Celo (verified onchain 2026-11-03). */
+/** The Embassy's operating wallet — the payTo every accept names. */
 export const PAY_TO = "0xD004278bC57FE4B9F743ABf17d713ed4169A88E9";
-export const AGENT_ID = 9966;
+
+/** Your ERC-8004 agent number, if you run this service under one.
+ *  AGENT_ID is a setting, never a constant: unset (or not a positive
+ *  whole number) means this deployment presents no agent identity —
+ *  none in its descriptions, none on its agent card, none in its
+ *  receipts. The number is yours: register your own on Celo and set it
+ *  here. Nothing about any other deployment's number belongs in these
+ *  bytes. */
+const AGENT_ID_RAW = (process.env.AGENT_ID || "").trim();
+export const AGENT_ID =
+  /^\d+$/.test(AGENT_ID_RAW) && Number(AGENT_ID_RAW) > 0 ? Number(AGENT_ID_RAW) : null;
+/** The public web address of your agent card — the page your agent
+ *  registration points at. Unset means no card is presented. */
+export const AGENT_CARD = (process.env.AGENT_CARD_URL || "").trim() || null;
+/** The acceptance policy over customers. Off (the default): the box is
+ *  open — anyone can pay. On: the box is agentid-only — a paying
+ *  customer must present their own agent number and prove it is
+ *  theirs (see the gate near the paid handler), and everyone else is
+ *  turned away before any money moves. */
+export const REQUIRE_AGENT_ID = /^(on|true|1|yes)$/i.test(
+  (process.env.REQUIRE_AGENT_ID || "").trim(),
+);
+/** The ERC-8004 identity registry contract — the public contract every
+ *  agent number lives in. ownerOf(agentId) there is the ownership
+ *  truth the gate reads; the address is the standard's, not ours. */
 export const AGENT_REGISTRY = "0x8004A169FB4a3325136EB29fA0ceB6D2e539a432";
-export const AGENT_CARD = "https://aemb.pro/agent.json";
 
 /** Price of one check: 0.001 in the asset's smallest unit (6 decimals). */
 const PRICE_SMALLEST_UNIT = "1000";
@@ -83,6 +109,7 @@ const PRICE_SMALLEST_UNIT = "1000";
 const NETWORKS = {
   mainnet: {
     network: "eip155:42220",
+    rpcUrl: "https://forno.celo.org",
     facilitatorUrl: "https://api.x402.celo.org",
     explorerTx: (tx) => `https://celoscan.io/tx/${tx}`,
     assets: [
@@ -100,6 +127,7 @@ const NETWORKS = {
   },
   sepolia: {
     network: "eip155:11142220",
+    rpcUrl: "https://forno.celo-sepolia.celo-testnet.org",
     facilitatorUrl: "https://api.x402.sepolia.celo.org",
     explorerTx: (tx) => `https://celo-sepolia.blockscout.com/tx/${tx}`,
     assets: [
@@ -113,25 +141,36 @@ const NETWORKS = {
 };
 const NET = NETWORKS[NETWORK_MODE] || NETWORKS.mainnet;
 
+/** The chain-read endpoint the agent gate uses, and the two identity
+ *  derivations every surface shares — one source, so the documents a
+ *  stranger reads can never disagree about who this deployment is. */
+const RPC_URL = (process.env.CELO_RPC_URL || "").trim() || NET.rpcUrl;
+const agentRegistryRef = () =>
+  AGENT_ID != null ? `${NET.network}:${AGENT_REGISTRY}` : null;
+const IDENTITY_CLAUSE = AGENT_ID != null ? ` ERC-8004 agentId ${AGENT_ID}.` : "";
+
 const VERIFY_DESCRIPTION =
   "Agent Embassy URL verification on Celo: fetch a URL and return a signed " +
   "attestation of what was observed (reachability, HTTP status, byte count, " +
   "SHA-256 of the body). Price 0.001 USD in USA₮ or USDC on Celo mainnet, " +
-  "settled through Celo's hosted x402 facilitator. ERC-8004 agentId 9966.";
+  "settled through Celo's hosted x402 facilitator." +
+  IDENTITY_CLAUSE;
 
 const PING_DESCRIPTION =
   "Agent Embassy conditional URL check on Celo: fetch a URL and return a " +
   "signed pass/fail attestation against the buyer's own conditions (HTTP " +
   "status, body substring, JSON value; default condition: status 200). " +
   "Price 0.001 USD in USA₮ or USDC on Celo mainnet, settled through Celo's " +
-  "hosted x402 facilitator. ERC-8004 agentId 9966.";
+  "hosted x402 facilitator." +
+  IDENTITY_CLAUSE;
 
 const CHANGES_DESCRIPTION =
   "Agent Embassy URL change comparison on Celo: fetch a URL and return a " +
   "signed attestation of whether its body SHA-256 differs from a hash the " +
   "buyer supplies. One call, one comparison — not a standing watch. " +
   "Price 0.001 USD in USA₮ or USDC on Celo mainnet, settled through Celo's " +
-  "hosted x402 facilitator. ERC-8004 agentId 9966.";
+  "hosted x402 facilitator." +
+  IDENTITY_CLAUSE;
 
 /** The paid shelf: one table drives the x402 routes, the paid handlers,
  *  the service card, and every discovery document, so the documents a
@@ -163,6 +202,14 @@ const PAID_ROUTES = [
   },
 ];
 
+/** One accept's extra block. With the agent gate on, the requirement
+ *  rides here — in the 402 challenge and in the discovery document —
+ *  so a buyer knows before paying that this box is agentid-only.
+ *  With the gate off the block is exactly the asset's own fields. */
+function acceptExtra(a) {
+  return REQUIRE_AGENT_ID ? { ...a.extra, agentIdRequired: true } : { ...a.extra };
+}
+
 /** The accepts set every paid route offers, in the challenge's own shape. */
 function flatAccepts() {
   return NET.assets.map((a) => ({
@@ -172,8 +219,114 @@ function flatAccepts() {
     amount: PRICE_SMALLEST_UNIT,
     payTo: PAY_TO,
     maxTimeoutSeconds: 300,
-    extra: a.extra,
+    extra: acceptExtra(a),
   }));
+}
+
+/* ------------------------------------------------------------------ */
+/* The agent gate (REQUIRE_AGENT_ID)                                   */
+/*                                                                     */
+/* The operator's acceptance policy over customers. Off: open. On: a   */
+/* paid call settles only when the customer presents their own         */
+/* ERC-8004 agent number — an `agentId` field in the call body — and   */
+/* the registry itself says that number belongs to the wallet in the   */
+/* signed payment authorization. The check runs before the payment     */
+/* flow is touched at all: a refusal makes no facilitator call,        */
+/* writes no receipt, and moves no funds. The facilitator still        */
+/* verifies the payment itself afterwards; the gate is the door,       */
+/* never a substitute for the payment's own proof.                     */
+/* ------------------------------------------------------------------ */
+
+const OWNER_OF_SELECTOR = "0x6352211e"; // ownerOf(uint256)
+
+/** Read the registry: who owns this agent number? Returns the owner
+ *  address (lowercase), or null when the number has no owner (an
+ *  unregistered number, or the call comes back empty). A transport
+ *  failure throws — the caller turns that into its own refusal, so a
+ *  broken chain read never waves a customer through or settles. */
+export async function registryOwnerOf(agentId) {
+  const data =
+    OWNER_OF_SELECTOR + BigInt(agentId).toString(16).padStart(64, "0");
+  const resp = await fetch(RPC_URL, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({
+      jsonrpc: "2.0",
+      id: 1,
+      method: "eth_call",
+      params: [{ to: AGENT_REGISTRY, data }, "latest"],
+    }),
+    signal: AbortSignal.timeout(6000),
+  });
+  const j = await resp.json();
+  if (typeof j?.result !== "string" || !/^0x[0-9a-fA-F]{64}$/.test(j.result)) {
+    return null;
+  }
+  return "0x" + j.result.slice(-40).toLowerCase();
+}
+
+/** The paying wallet, read from the presented payment payload itself.
+ *  The payload is the buyer's own signed envelope; the gate compares
+ *  its claimed payer against the registry, and the facilitator's own
+ *  verification of the signature follows in the normal flow — a payer
+ *  field that does not match its signature settles nothing there. */
+function presentedPayer(req) {
+  const header = req.header("payment-signature") || req.header("x-payment");
+  if (!header) return null;
+  try {
+    const payload = JSON.parse(Buffer.from(header, "base64").toString("utf8"));
+    const from = payload?.payload?.authorization?.from;
+    return typeof from === "string" && /^0x[0-9a-fA-F]{40}$/.test(from) ? from : null;
+  } catch {
+    return null;
+  }
+}
+
+/** Run the gate for one paid call. Returns { agentId } when the
+ *  customer may proceed to the payment flow, or { refusal } — a plain
+ *  response naming the reason. */
+async function checkAgentGate(req) {
+  const refuse = (status, error, detail) => ({ refusal: { status, body: { error, detail } } });
+  const raw = req.body?.agentId;
+  const agentId =
+    typeof raw === "number" && Number.isInteger(raw) && raw > 0
+      ? raw
+      : typeof raw === "string" && /^\d+$/.test(raw.trim()) && Number(raw) > 0
+        ? Number(raw)
+        : null;
+  if (agentId == null) {
+    return refuse(
+      403,
+      "agent_id_required",
+      "This service is set to agentid only: send your ERC-8004 agentId in the call body. Only customers with their own agent number can pay here.",
+    );
+  }
+  const payer = presentedPayer(req);
+  if (!payer) {
+    return refuse(
+      403,
+      "agent_id_unverifiable",
+      "The paying wallet could not be read from the payment authorization, so the agent number's ownership could not be checked. Nothing was settled.",
+    );
+  }
+  let owner;
+  try {
+    owner = await registryOwnerOf(agentId);
+  } catch {
+    return refuse(
+      503,
+      "agent_id_check_failed",
+      "The agent registry could not be read just now, so the agent number's ownership could not be checked. Nothing was settled; try again shortly.",
+    );
+  }
+  if (!owner || owner !== payer.toLowerCase()) {
+    return refuse(
+      403,
+      "agent_id_not_owned",
+      `The registry says agent ${agentId} belongs to ${owner ?? "no one"}, not to the paying wallet ${payer}. Only the owner of an agent number can pay with it here. Nothing was settled.`,
+    );
+  }
+  return { agentId };
 }
 
 /* ------------------------------------------------------------------ */
@@ -659,7 +812,7 @@ function buildHttpServer() {
         scheme: "exact",
         network: NET.network,
         payTo: PAY_TO,
-        price: { asset: a.address, amount: PRICE_SMALLEST_UNIT, extra: a.extra },
+        price: { asset: a.address, amount: PRICE_SMALLEST_UNIT, extra: acceptExtra(a) },
         maxTimeoutSeconds: 300,
       })),
       description: route.description,
@@ -691,6 +844,7 @@ export async function createApp() {
       receipts_count: readReceiptLines().length,
       receipt_chain_head: lastReceiptHash(),
       agent_id: AGENT_ID,
+      require_agent_id: REQUIRE_AGENT_ID,
       pay_to: PAY_TO,
     });
   });
@@ -699,12 +853,15 @@ export async function createApp() {
     res.json({
       name: "Agent Embassy",
       what: "Pay-per-call verification, settled on Celo. Every settled call returns a signed outcome receipt.",
-      agent_identity: {
-        standard: "ERC-8004",
-        agent_id: AGENT_ID,
-        agent_registry: `${NET.network}:${AGENT_REGISTRY}`,
-        agent_card: AGENT_CARD,
-      },
+      agent_identity:
+        AGENT_ID != null
+          ? {
+              standard: "ERC-8004",
+              agent_id: AGENT_ID,
+              agent_registry: agentRegistryRef(),
+              agent_card: AGENT_CARD,
+            }
+          : null,
       pay_to: PAY_TO,
       network: NET.network,
       facilitator: NET.facilitatorUrl,
@@ -752,9 +909,10 @@ export async function createApp() {
       x402Support: true,
       active: true,
       supportedTrust: ["reputation"],
-      registrations: [
-        { agentId: AGENT_ID, agentRegistry: `${NET.network}:${AGENT_REGISTRY}` },
-      ],
+      registrations:
+        AGENT_ID != null
+          ? [{ agentId: AGENT_ID, agentRegistry: agentRegistryRef() }]
+          : [],
     });
   });
 
@@ -942,7 +1100,8 @@ export async function createApp() {
         title: "Agent Embassy on Celo",
         version: "1.0.0",
         description:
-          "Pay-per-call verification settled in USA₮ or USDC on Celo mainnet through Celo's hosted x402 facilitator. Every settled call returns a signed receipt anyone can verify. ERC-8004 agentId 9966.",
+          "Pay-per-call verification settled in USA₮ or USDC on Celo mainnet through Celo's hosted x402 facilitator. Every settled call returns a signed receipt anyone can verify." +
+          IDENTITY_CLAUSE,
       },
       servers: [{ url: publicBase() }],
       paths: {
@@ -966,7 +1125,8 @@ export async function createApp() {
       "",
       "Pay-per-call verification for agents, settled on Celo mainnet (eip155:42220) through Celo's hosted x402 facilitator. No account, no subscription: pay 0.001 per call in USA₮ (preferred) or USDC, receive the check result plus a signed receipt (embassy-receipt/2) carrying the settlement transaction hash.",
       "",
-      "Identity: ERC-8004 agentId 9966 on Celo mainnet. PayTo (also the ERC-8021 attribution for x402): " + PAY_TO + ".",
+      (AGENT_ID != null ? `Identity: ERC-8004 agentId ${AGENT_ID} on Celo mainnet. ` : "") +
+        "PayTo (also the ERC-8021 attribution for x402): " + PAY_TO + ".",
       "",
       "## Paid endpoints (x402 v2, scheme exact)",
       ...PAID_ROUTES.flatMap((r) => [
@@ -1003,6 +1163,18 @@ export async function createApp() {
         req.header("payment-signature") || req.header("x-payment") || undefined,
       routePattern: route.pattern,
     };
+
+    /* The agent gate runs before the payment flow is touched: with
+     * the box set to agentid-only, a customer who presents no agent
+     * number, or one that is not theirs, is refused here — no
+     * facilitator call, no receipt, no funds moved. A customer who
+     * passes carries their verified number into the receipt below. */
+    let verifiedAgentId = null;
+    if (REQUIRE_AGENT_ID && context.paymentHeader) {
+      const gate = await checkAgentGate(req);
+      if (gate.refusal) return res.status(gate.refusal.status).json(gate.refusal.body);
+      verifiedAgentId = gate.agentId;
+    }
 
     let processed;
     try {
@@ -1072,7 +1244,7 @@ export async function createApp() {
       issuer: {
         name: "Agent Embassy",
         agent_id: AGENT_ID,
-        agent_registry: `${NET.network}:${AGENT_REGISTRY}`,
+        agent_registry: agentRegistryRef(),
         agent_card: AGENT_CARD,
       },
       chain: {
@@ -1087,6 +1259,9 @@ export async function createApp() {
           asset: processed.paymentRequirements.asset,
           amount: processed.paymentRequirements.amount,
           authorization_nonce: auth.nonce || null,
+          /* The customer's own agent number, recorded only when the
+           * gate verified it against the registry before settlement. */
+          ...(verifiedAgentId != null ? { agent_id: verifiedAgentId } : {}),
         },
         ACTION: { check: route.action, result: work },
         PROOF: {
@@ -1125,7 +1300,7 @@ if (import.meta.url === `file://${process.argv[1]}`) {
   const app = await createApp();
   app.listen(PORT, () => {
     console.log(
-      `agent-embassy-celo listening on :${PORT} network=${NET.network} facilitator=${NET.facilitatorUrl} key=${FACILITATOR_API_KEY ? "set" : "UNSET"} signing=${signerAccount ? "set" : "UNSET"}`,
+      `agent-embassy-celo listening on :${PORT} network=${NET.network} facilitator=${NET.facilitatorUrl} key=${FACILITATOR_API_KEY ? "set" : "UNSET"} signing=${signerAccount ? "set" : "UNSET"} agent=${AGENT_ID ?? "none"} gate=${REQUIRE_AGENT_ID ? "agentid-only" : "open"}`,
     );
   });
 }

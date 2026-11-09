@@ -26,8 +26,11 @@ function check(label, ok, detail = "") {
 }
 const sameSet = (xs, ys) => xs.length === ys.length && xs.every((x) => ys.includes(x));
 
+const bootEnv = { ...process.env, PORT: String(PORT), CELO_NETWORK: "mainnet" };
+/* Identity and gate are settings; pin the clean out-of-the-box state. */
+for (const k of ["AGENT_ID", "AGENT_CARD_URL", "REQUIRE_AGENT_ID", "CELO_RPC_URL"]) delete bootEnv[k];
 const child = spawn("node", ["src/server.js"], {
-  env: { ...process.env, PORT: String(PORT), CELO_NETWORK: "mainnet" },
+  env: bootEnv,
   stdio: ["ignore", "pipe", "pipe"],
 });
 let bootLog = "";
@@ -78,7 +81,7 @@ try {
   const card = await (await fetch(`${BASE}/.well-known/agent.json`)).json();
   const cardX402 = (card.services || []).filter((s) => s.name === "x402").map((s) => new URL(s.endpoint).pathname);
   check("agent card names the whole shelf", sameSet(cardX402, EXPECTED_ROUTES), cardX402.join(", "));
-  check("agent card keeps registration 9966", card.registrations?.[0]?.agentId === 9966);
+  check("agent card carries no registration (no agent id configured)", !card.registrations || card.registrations.length === 0);
   check("agent card declares x402 support", card.x402Support === true);
 
   /* llms.txt */

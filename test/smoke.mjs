@@ -6,7 +6,9 @@
  *
  * Asserts, per paid route:
  *  1. GET /health -> 200, network eip155:42220
- *  2. GET /       -> 200, names ERC-8004 agentId 9966 and the payTo wallet
+ *  2. GET /       -> 200, presents no agent identity (none is
+ *     configured in this boot) and names the payTo wallet; /health
+ *     reports the agent gate open
  *  3. POST <route> without payment -> 402 whose accepts[] carry:
  *     x402Version 2, scheme "exact", network "eip155:42220",
  *     payTo 0xD004278bC57FE4B9F743ABf17d713ed4169A88E9,
@@ -39,8 +41,12 @@ function check(label, ok, detail = "") {
   if (!ok) failures++;
 }
 
+const bootEnv = { ...process.env, PORT: String(PORT), CELO_NETWORK: "mainnet" };
+/* The identity and the gate are settings; this boot pins the clean
+ * out-of-the-box state no matter what the operator's shell carries. */
+for (const k of ["AGENT_ID", "AGENT_CARD_URL", "REQUIRE_AGENT_ID", "CELO_RPC_URL"]) delete bootEnv[k];
 const child = spawn("node", ["src/server.js"], {
-  env: { ...process.env, PORT: String(PORT), CELO_NETWORK: "mainnet" },
+  env: bootEnv,
   stdio: ["ignore", "pipe", "pipe"],
 });
 let bootLog = "";
@@ -100,12 +106,12 @@ try {
 
   const health = await (await fetch(`${BASE}/health`)).json();
   check("health network is Celo mainnet", health.network === "eip155:42220", health.network);
-  check("health agent_id is 9966", health.agent_id === 9966);
+  check("health agent_id null (no identity configured)", health.agent_id === null);
+  check("health gate open (require_agent_id false)", health.require_agent_id === false);
   check("health pay_to exact", health.pay_to === EXPECT_PAYTO);
 
   const card = await (await fetch(`${BASE}/`)).json();
-  check("service card names ERC-8004", card.agent_identity?.standard === "ERC-8004");
-  check("service card agent_id 9966", card.agent_identity?.agent_id === 9966);
+  check("service card presents no agent identity", card.agent_identity === null);
 
   for (const route of PAID_ROUTES) await checkRoute(route);
 } finally {

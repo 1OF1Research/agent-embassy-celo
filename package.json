@@ -19,7 +19,8 @@
     "test:receipt": "node test/receipt-signature.mjs",
     "test:logic": "node test/check-logic.mjs",
     "test:ladder": "node test/proof-ladder.mjs",
-    "test:discovery": "node test/discovery.mjs"
+    "test:discovery": "node test/discovery.mjs",
+    "test:gate": "node test/agent-gate.mjs"
   },
   "type": "module",
   "version": "1.0.0"

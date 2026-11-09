@@ -23,24 +23,31 @@ Three paid checks, one price — **0.001 USD** in **USA₮** (preferred) or **US
 
 Why USA₮: it is a US-dollar stablecoin issued by Anchorage Digital Bank, N.A. and supported by Tether, built to move between independent parties on cheap rails. The user it serves is any agent — or person — who needs a verifiable answer for a tenth of a cent, with no account, no card, and no subscription.
 
-## Identity (ERC-8004)
+## Run it under your own agent identity
 
-Required by every track of this hackathon, and already held:
+Out of the box, this service presents no agent identity at all — no number in its descriptions, no registration on its agent card, none in its receipts. If you run it under your own ERC-8004 agent number, two settings present yours instead:
 
-- **Agent ID 9966** on Celo mainnet, registry `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`
-- Owner / PayTo: `0xD004278bC57FE4B9F743ABf17d713ed4169A88E9`
-- Agent card (the registry tokenURI): https://aemb.pro/agent.json
-- Verify it yourself: `ownerOf(9966)` and `tokenURI(9966)` on the registry contract via any Celo RPC.
+- `AGENT_ID` — your agent number. Register your own on Celo first: agent numbers live in the ERC-8004 registry contract, `0x8004A169FB4a3325136EB29fA0ceB6D2e539a432`. You can check any number yourself with `ownerOf(<number>)` and `tokenURI(<number>)` on that contract, from any Celo RPC.
+- `AGENT_CARD_URL` — the public address of your agent card, the page your registration points at.
+
+The number is a setting, never compiled in: the same bytes run under any number, or none. (This hackathon requires an agent identity; this deployment's own number is set in its deployment configuration, the same way yours would be.)
+
+### Open, or agentid only
+
+You also choose who may pay you:
+
+- **Open** — the default (`REQUIRE_AGENT_ID` unset or `off`). Anyone can pay. The box is open.
+- **Agentid only** — set `REQUIRE_AGENT_ID=on` and only customers with their own agent number can pay you. The customer sends their `agentId` with the call; before any money moves, the service reads the registry on Celo and checks that the number belongs to the wallet in the customer's signed payment. Everyone else is turned away with a plain refusal naming the reason — no payment taken, no receipt written. The 402 challenge says so up front: while this mode is on, every offer carries `agentIdRequired`. A customer who passes has their agent number recorded in the receipt.
 
 ## Attribution (ERC-8021)
 
-The hackathon rules state that for x402 transactions the PayTo wallet address is the attribution, because attribution tags are not yet supported by x402. The PayTo address above is therefore this project's attribution, and it is declared in the submission in exactly those terms.
+The hackathon rules state that for x402 transactions the PayTo wallet address is the attribution, because attribution tags are not yet supported by x402. The PayTo address in every 402 challenge is therefore this project's attribution, and it is declared in the submission in exactly those terms.
 
 ## Verify everything yourself
 
 Nothing in this entry asks to be trusted. In ladder order, against the live deployment (`https://agent-embassy-celo.fly.dev` once deployed):
 
-1. **Identity** — `ownerOf(9966)` and `tokenURI(9966)` on the registry above, from any Celo RPC.
+1. **Identity** — this deployment's agent card (`/.well-known/agent.json`) names its registration; read `ownerOf` and `tokenURI` for that number on the registry contract above, from any Celo RPC. The registry entry, not this server, is the identity truth.
 2. **The offer** — POST to any check endpoint without payment and read the 402 challenge: both assets, the exact PayTo, the 0.001 price. The discovery documents say the same thing in machine form: `/.well-known/x402.json`, `/openapi.json`, `/llms.txt`, `/.well-known/agent.json`.
 3. **A receipt's signature** — the signer is published outside the receipts at `/.well-known/embassy-signer.json`. By hand: take the receipt JSON with `signature.value` set to `null`, SHA-256 the compact JSON, and ecrecover the EIP-191 signature over that digest; the recovered address must equal `signature.signer` and the published signer. Or in one click: `GET /v1/receipts/<receipt_id>/verify` re-derives both the signature verdict and the chain-link verdict — separately, never blended — and the human page at `/proof` renders the same checks.
 4. **The settlement** — `chain.PROOF.settlement_tx` in any receipt opens on Celoscan; the payment does not depend on our server's word.
@@ -61,6 +68,7 @@ npm run test:receipt   # signs a test receipt and verifies it by the documented 
 npm run test:logic     # the checks' decision logic: fetch boundary, conditions, chain writes
 npm run test:ladder    # the proof ladder walked end to end, incl. an altered receipt
 npm run test:discovery # the discovery shelf names exactly the shelf the server answers
+npm run test:gate      # the configured identity, and open vs agentid-only acceptance
 ```
 
 Environment:
@@ -71,6 +79,10 @@ Environment:
 | `EMBASSY_SIGNING_KEY` | Dedicated receipt-signing key (statements only, cannot move funds). Without it, receipts are issued unsigned and say so. |
 | `CELO_NETWORK` | `mainnet` (default) or `sepolia` (testnet rehearsal; USDC only). |
 | `PUBLIC_BASE_URL` | Public URL of this deployment, used in the agent card and discovery documents. |
+| `AGENT_ID` | Your ERC-8004 agent number (optional). Unset: the service presents no agent identity. |
+| `AGENT_CARD_URL` | Public address of your agent card (optional). |
+| `REQUIRE_AGENT_ID` | `on`: agentid only — only customers who present an agent number the registry says is theirs can pay. Unset or `off`: open to anyone. |
+| `CELO_RPC_URL` | Celo JSON-RPC endpoint used for the ownership check. Default: the public Celo node for the chosen network. |
 | `PORT`, `DATA_DIR` | Listen port; receipt-log directory. |
 
 ## Receipts
@@ -85,6 +97,7 @@ Every settled call appends one receipt to `data/receipts.jsonl` (append-only, ha
 - `test/check-logic.mjs` — the fetch boundary, condition evaluator, and receipt-chain writes under parallelism.
 - `test/proof-ladder.mjs` — signer document, receipt reads, verify verdicts, incl. an altered receipt failing exactly one verdict.
 - `test/discovery.mjs` — the four discovery documents name the same shelf, and every advertised route answers.
+- `test/agent-gate.mjs` — the configured identity (a placeholder number, presented everywhere or nowhere) and the acceptance policy: open mode's bare offers, agentid-only mode's advertised requirement and its refusals — ownership read from a named local stub of the registry endpoint, never from the real chain.
 - `.env.example` — configuration template. Secrets live in `.env` only, never in this repo.
 
 ## License

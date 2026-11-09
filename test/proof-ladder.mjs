@@ -43,9 +43,9 @@ function receiptShape(id, txByte) {
     issued_at: new Date().toISOString(),
     issuer: {
       name: "Agent Embassy",
-      agent_id: 9966,
+      agent_id: 12345,
       agent_registry: "eip155:42220:0x8004A169FB4a3325136EB29fA0ceB6D2e539a432",
-      agent_card: "https://aemb.pro/agent.json",
+      agent_card: "https://example.com/agent.json",
     },
     chain: {
       REQUEST: { endpoint: "POST /v1/check/verify", input_sha256: "0".repeat(64) },
